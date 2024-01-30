@@ -197,6 +197,37 @@ def select_lines_singlepanel(array, nselections):
     return xvals
 
 
+def select_lines_singlepanel_unbound(array):
+    """
+    Matplotlib-based function to select an x-value, or series of x-values
+    From the plot of a 1D array.
+
+    :param array: array-like
+        Array to plot and select from
+    :return xvals: array-like
+        Array of selected x-values with length nselections
+    """
+
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.set_title("Select Positions, then close window")
+    spectrum, = ax.plot(array)
+
+    xvals = []
+
+    def onselect(event):
+        xcd = event.xdata
+        ax.axvline(xcd, c='C1', linestyle=':')
+        fig.canvas.draw()
+        xvals.append(xcd)
+        print("Selected: " + str(xcd))
+
+    conn = fig.canvas.mpl_connect('button_press_event', onselect)
+    plt.show()
+    xvals = np.array(xvals)
+    return xvals
+
+
 def select_lines_doublepanel(array1, array2, nselections):
     """
     Matplotlib-based function to select an x-value, or series of x-values
