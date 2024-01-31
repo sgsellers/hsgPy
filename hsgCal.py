@@ -1,4 +1,5 @@
 import astropy.io.fits as fits
+import astropy.units as u
 import configparser
 import glob
 import matplotlib.pyplot as plt
@@ -9,6 +10,8 @@ import scipy.interpolate as scinterp
 import tqdm
 from astropy.constants import c
 c_kms = c.value/1e3
+from astropy.coordinates import SkyCoord
+from sunpy.coordinates import frames
 from . import spectraTools as spex
 
 
@@ -68,7 +71,7 @@ class hsgCal:
             Extension 2 has the wavelength array with dimensions nlambda
     """
 
-    def __init_(self, camera, configFile):
+    def __init__(self, camera, configFile):
         """
         Parameters:
         -----------
@@ -102,6 +105,7 @@ class hsgCal:
         self.baseDir = ""
         self.reduceDir = ""
         self.finalDir = ""
+        self.reducedFilePattern = ""
 
         self.darkList = [""]
         self.solarFlatList = [""]
@@ -112,10 +116,6 @@ class hsgCal:
         self.solarFlatFile = ""
         self.solarGainFile = ""
         self.lampGainFile = ""
-
-        self.dataList = [""]
-        self.dataShape = None
-        self.dataBounds = None
 
         self.skewShifts = None
         self.beamEdges = []
@@ -138,6 +138,8 @@ class hsgCal:
         self.referenceFTSspec = []
         self.referenceFTSwave = []
         self.wavelengthArray = []
+
+        self.flipWave = False
 
         self.velocityMapLineIndex = None
 
@@ -169,6 +171,7 @@ class hsgCal:
         self.baseDir = config[self.camera]['baseDir']
         self.reduceDir = config[self.camera]['reduceDir']
         self.finalDir = os.path.join(self.reduceDir, "calibratedScans")
+        self.reducedFilePattern = config[self.camera]['reducedFilePattern']
         if not os.path.isdir(self.finalDir):
             print("{0}: os.mkdir: attempting to create directory:"
                   "{1}".format(__name__, self.finalDir))
@@ -244,6 +247,10 @@ class hsgCal:
 
         self.fringeMethod = config[self.camera]['fringeCorrection'].upper()
 
+        if config[self.camera]['reverseWave'].upper() == "TRUE":
+            self.flipWave = True
+        return
+
 
     def hsg_average_image_from_list(self, fileList):
         """
@@ -269,7 +276,10 @@ class hsgCal:
         for file in fileList:
             with fits.open(file) as hdu:
                 for ext in hdu[1:]:
-                    avgImg += ext.data[0]
+                    if self.flipWave:
+                        avgImg += np.flip(ext.data[0], axis=1)
+                    else:
+                        avgImg += ext.data[0]
                     imNum += 1
         avgImg = avgImg / imNum
         return avgImg, imNum
@@ -303,6 +313,11 @@ class hsgCal:
                 self.spectralEdges = [hdu[0].header['SLIT1'], hdu[0].header['SLIT2']]
                 hairs = [key for key in list(hdu[0].header.keys()) if "HAIR" in key]
                 self.hairlines = [hdu[0].header[key] for key in hairs]
+                self.deskewShifts = hdu[2].data
+                self.lineSelectionIndices = hdu[3].data
+                self.ftsSelectionIndices = hdu[4].data
+                self.referenceFTSwave = hdu[5].data
+                self.referenceFTSspec = hdu[6].data
         else:
             self.hsg_compute_gain()
         return
@@ -333,7 +348,7 @@ class hsgCal:
             hdu[0].header['AUTHOR'] = "sellers"
             hdu[0].header['NSUMEXP'] = self.numFlat
             hdu.writeto(self.solarFlatFile, overwrite=True)
-        if not os.path.exists(self.lampGainFile) & self.lampGain:
+        if (not os.path.exists(self.lampGainFile)) & (self.lampGain is not None):
             hdu = fits.HDUList([fits.PrimaryHDU(self.lampGain)])
             hdu[0].header['DATATYPE'] = "LAMPGAIN"
             hdu[0].header['INSTR'] = "HSG"
@@ -342,7 +357,15 @@ class hsgCal:
             hdu[0].header['NSUMEXP'] = self.numLamp
             hdu.writeto(self.lampGainFile, overwrite=True)
         if not os.path.exists(self.solarGainFile):
-            hdu = fits.HDUList([fits.PrimaryHDU(self.solarGain), fits.PrimaryHDU(self.coarseGain)])
+            hdu = fits.HDUList([
+                fits.PrimaryHDU(self.solarGain),
+                fits.ImageHDU(self.coarseGain),
+                fits.ImageHDU(self.deskewShifts),
+                fits.ImageHDU(self.lineSelectionIndices),
+                fits.ImageHDU(self.ftsSelectionIndices),
+                fits.ImageHDU(self.referenceFTSwave),
+                fits.ImageHDU(self.referenceFTSspec)
+            ])
             hdu[0].header['DATATYPE'] = "SGAIN"
             hdu[0].header['INSTR'] = "HSG"
             hdu[0].header['CAMERA'] = self.camera
@@ -354,6 +377,14 @@ class hsgCal:
             hdu[0].header['SLIT2'] = self.spectralEdges[1]
             for i in range(len(self.hairlines)):
                 hdu[0].header['HAIR'+str(i+1)] = self.hairlines[i]
+            hdu[0].header['EXTNAME'] = 'FINEGAIN'
+            hdu[1].header['EXTNAME'] = 'COARSEGAIN'
+            hdu[2].header['EXTNAME'] = 'DESKEWSHIFTS'
+            hdu[3].header['EXTNAME'] = 'GAINLINES'
+            hdu[4].header['EXTNAME'] = 'FTSLINES'
+            hdu[5].header['EXTNAME'] = 'FTSWAVE'
+            hdu[6].header['EXTNAME'] = 'FTSSPEC'
+
             hdu.writeto(self.solarGainFile, overwrite=True)
         return
 
@@ -363,7 +394,7 @@ class hsgCal:
         Creates average lamp gain image (that is, dark corrected and normalized)
         """
         avgLampFlat, numLamp = self.hsg_average_image_from_list(self.lampFlatList)
-        if avgLampFlat:
+        if avgLampFlat is not None:
             lampGain = avgLampFlat - self.avgDark
             lampGain = lampGain / np.nanmedian(lampGain)
             return lampGain, numLamp
@@ -386,7 +417,7 @@ class hsgCal:
         # Position of hairlines AFTER image is cropped.
         self.hairlines = hairlines - self.beamEdges[0]
 
-        if self.lampGain:
+        if self.lampGain is not None:
             croppedFlat = (self.avgFlat - self.avgDark) / self.lampGain
             croppedFlat = croppedFlat[
                 self.beamEdges[0]:self.beamEdges[1],
@@ -443,12 +474,15 @@ class hsgCal:
                 [line - 5, line + 5],
                 hairline_positions=self.hairlines
             )
-            gains.append(g)
-            coarse_gains.append(cg)
+            gains.append(g / np.nanmedian(g))
+            coarse_gains.append(cg / np.nanmedian(cg))
             deskews.append(desk)
-            gainmeans.append(np.nanmean(gain))
+            gainmeans.append(np.nanmean(g / np.nanmedian(g)))
         # Step 3: Find the gain table with the mean nearest 1 (i.e., best table)
         gainidx = spex.find_nearest(np.array(gainmeans), 1)
+        self.solarGain = gains[gainidx]
+        self.coarseGain = coarse_gains[gainidx]
+        self.deskewShifts = deskews[gainidx]
         return
 
 
@@ -466,6 +500,7 @@ class hsgCal:
         :return:
         """
         croppedFlat = self.avgFlat - self.avgDark
+        croppedFlat = croppedFlat / self.lampGain
         croppedFlat = croppedFlat[self.beamEdges[0]:self.beamEdges[1], self.spectralEdges[0]:self.spectralEdges[1]]
         croppedFlat = croppedFlat / self.solarGain
         deskewedFlat = np.zeros(croppedFlat.shape)
@@ -480,13 +515,16 @@ class hsgCal:
             deskewedFlat[int(deskewedFlat.shape[0]/2 - 30):int(deskewedFlat.shape[0]/2 + 30), :],
             axis=0
         )
+        import matplotlib.pyplot as plt
+
+        deskewedCenters = np.array(self.lineSelectionIndices) - int(self.deskewShifts[int(deskewedFlat.shape[0]/2)])
         trueCenters = [
-            spex.find_line_core(meanProfile[x - 7:x + 7]) + x + 7 for x in self.lineSelectionIndices
+            spex.find_line_core(meanProfile[x - 7:x + 7]) + x + 7 for x in deskewedCenters
         ]
         ftsRefWvls = [
             scinterp.interp1d(
-                np.arange(len(self.referenceFTSspec)),
-                self.referenceFTSspec,
+                np.arange(len(self.referenceFTSwave)),
+                self.referenceFTSwave,
                 kind='linear'
             )(x) for x in self.ftsSelectionIndices
         ]
@@ -527,10 +565,28 @@ class hsgCal:
                 # This should be okay -- sometimes the effort needed to generalize a thing is greater
                 # than the effort needed to write a hack that will work 99.9999999% of the time.
                 self.stepSpacing = float(aiwSteps[0].split(" ")[-1])
+                timestamps = []
+                dst_slat = []
+                dst_slng = []
+                dst_gdran = []
+                dst_sdim = []
+                dst_llvl = []
+                dst_see = []
+                exptime = []
                 for j in range(1, len(schdu)):
-                    rasterStep = schdu[j].data
+                    timestamps.append(schdu[j].header['DATE-OBS'])
+                    dst_slat.append(schdu[j].header['DST_SLAT'])
+                    dst_slng.append(schdu[j].header['DST_SLNG'])
+                    dst_gdran.append(schdu[j].header['DST_GDRN'])
+                    dst_sdim.append(schdu[j].header['DST_SDIM'])
+                    dst_llvl.append(schdu[j].header['DST_LLVL'])
+                    dst_see.append(schdu[j].header['DST_SEE'])
+                    exptime.append(schdu[j].header['EXPTIME'])
+                    rasterStep = schdu[j].data[0]
+                    if self.flipWave:
+                        rasterStep = np.flip(rasterStep, axis=1)
                     rasterStep = rasterStep - self.avgDark
-                    if self.lampGain:
+                    if self.lampGain is not None:
                         rasterStep = rasterStep / self.lampGain
                     rasterStep = rasterStep[
                         self.beamEdges[0]:self.beamEdges[1],
@@ -546,11 +602,28 @@ class hsgCal:
                             self.deskewShifts[k],
                             mode='nearest'
                         )
+                metaparams = np.rec.fromarrays(
+                    [
+                        np.array(timestamps, dtype='datetime64[ms]'),
+                        np.array(exptime),
+                        np.array(dst_slat),
+                        np.array(dst_slng),
+                        np.array(dst_gdran) - 13.3,  # 13.3 degree offset thanks to old ESG
+                        np.array(dst_sdim),
+                        np.array(dst_llvl),
+                        np.array(dst_see)
+                    ],
+                    names=[
+                        'TIMESTAMPS', 'EXPTIME',
+                        'DST_SLAT', 'DST_SLNG', 'DST_GDRN',
+                        'DST_SDIM', 'DST_LLVL', 'DST_SEE'
+                    ]
+                )
                 if selectLine:
-                    vmaps = self.hsg_create_velocity_maps(correctedDataCube)
-                    self.packageScan(correctedDataCube, vmapList=vmaps)
+                    vmaps, refwvls = self.hsg_create_velocity_maps(correctedDataCube)
+                    self.packageScan(correctedDataCube, metaparams, vmapList=vmaps, rwvlList=refwvls)
                 else:
-                    self.packageScan(correctedDataCube)
+                    self.packageScan(correctedDataCube, metaparams)
         return
 
 
@@ -571,18 +644,20 @@ class hsgCal:
                 self.deskewedFlat[int(self.deskewedFlat.shape[0]/2 - 30):int(self.deskewedFlat.shape[0]/2 + 30), :],
                 axis=0
             )
-            vmapCoarseIndices = spex.select_lines_singlepanel_unbound(meanProfile)
+            vmapCoarseIndices = spex.select_lines_singlepanel_unbound_xarr(meanProfile, xarr=self.wavelengthArray)
             vmapFineIndices = [
                 spex.find_line_core(meanProfile[x - 7:x + 7]) + x + 7 for x  in vmapCoarseIndices
             ]
             self.velocityMapLineIndex = vmapFineIndices
         vmaps = []
+        refwvls = []
         for index in self.velocityMapLineIndex:
             refwvl = scinterp.interp1d(
                 np.arange(len(self.wavelengthArray)),
                 self.wavelengthArray,
                 kind='linear'
             )(index)
+            refwvls.append(float(refwvl))
             vmap = np.zeros((spectralCube.shape[0], spectralCube.shape[1]))
             for i in range(spectralCube.shape[0]):
                 for j in range(spectralCube.shape[1]):
@@ -592,14 +667,193 @@ class hsgCal:
                     )
                     vmap[i, j] = c_kms * (cwvl - refwvl)/refwvl
             vmaps.append(vmap)
-        return vmaps
+        return vmaps, refwvls
 
 
-    def packageScan(self, correctedScan, vmapList=None):
+    def packageScan(self, correctedScan, metadata, vmapList=None, rwvlList=None):
         """
         Packages corrected scans, along with the level-1.5 velocity products
-        :param correctedScan:
-        :param vmapList:
+        :param correctedScan: numpy.ndarray
+            Dark, gain corrected scan for save.
+        :param metadata: nump.rec.array
+            Numpy recarray of import header attributes
+        :param vmapList: list of numpy.ndarray
+            List of 2D numpy.ndarrays corresponding to velocity maps
+        :param rwvlList: list of float
+            List of wavelength values used as reference wavelengths for corresponding vmap.
         :return:
         """
+        t0 = metadata['TIMESTAMPS'][0]
+        t1 = metadata['TIMESTAMPS'][-1] + np.timedelta64(int(metadata['EXPTIME'][-1]), "ms")
+        date, time = metadata['TIMESTAMPS'][0].astype('datetime64[s]').astype(str).split("T")
+        date = date.replace("-", "")
+        time = time.replace(":", "")
+        outname = self.reducedFilePattern.format(
+            date,
+            time,
+            correctedScan.shape[1]
+        )
+        outfile = os.path.join(self.finalDir, outname)
+
+        prsteps = [
+            'DARK-SUBTRACTION',
+            'FLATFIELDING',
+            'WAVELENGTH-CALIBRATION'
+        ]
+        prstep_comments = [
+            'hsgPy/SSOSoft',
+            'hsgPy/SSOSoft',
+            'hsgPy/SSOSoft, FTS atlas'
+        ]
+        if self.fringeMethod != "NONE":
+            prsteps.append("FRINGE-CORRECTION")
+            prstep_comments.append("hsgPy/SSOSoft, Fourier Filter")
+        if vmapList:
+            prsteps.append("LOS-VELOCITY")
+            prstep_comments.append("hsgPy/SSOSoft, Fourier Phases")
+
+        centerCoord = SkyCoord(
+            metadata['DST_SLNG'][0] * u.deg, metadata['DST_SLAT'][0] * u.deg,
+            obstime=t0.astype(str), observer='earth', frame=frames.HeliographicStonyhurst
+        ).transform_to(frames.Helioprojective)
+
+        fovx = correctedScan.shape[1] * self.stepSpacing
+        fovy = correctedScan.shape[0] * self.arcsecPerPixel
+
+        ext0 = fits.PrimaryHDU(correctedScan)
+        ext0.header['EXTNAME'] = 'SPECTRAL-DATA'
+        ext0.header['DATE'] = (np.datetime64('now').astype(str), "File creation date and time (UTC)")
+        # Base origin keywords
+        ext0.header['ORIGIN'] = ("NMSU/SSOC", "Institution that created this FITS file")
+        ext0.header['TELESCOP'] = ('DST', "Telescope used to acquire this data")
+        ext0.header['INSTRUME'] = ("HSG", "Instrument used to acquire this data")
+        ext0.header['CAMERA'] = self.camera
+        if vmapList:
+            ext0.header['DATA_LEV'] = (1.5, "Includes derived parameters")
+        else:
+            ext0.header['DATA_LEV'] = 1
+        # Timing
+        ext0.header['STARTOBS'] = t0.astype(str)
+        ext0.header['ENDOBS'] = t1.astype(str)
+        ext0.header['EXPTIME'] = metadata['EXPTIME'][0]
+        ext0.header['BTYPE'] = 'Intensity'
+        ext0.header['BUNIT'] = 'Corrected DN'
+        # Coordinates (Set 1)
+        ext0.header['XCEN'] = (round(centerCoord.Tx.value, 3), "Center X-Coordinate (arcsec)")
+        ext0.header['YCEN'] = (round(centerCoord.Ty.value, 3), "Center Y-Coordinate (arcsec)")
+        ext0.header['FOVX'] = (fovx, "Field-of-view in X (arcsec)")
+        ext0.header['FOVY'] = (fovy, "Field-of-view in Y (arcsec)")
+        ext0.header['ROT'] = (round(metadata['DST_GDRN'][0], 3), "Relative to Solar-North (deg)")
+        ext0.header['D_SUN'] = (metadata['DST_SDIM'][0], "Solar Disk Diameter (arcsec)")
+        # Coordinates (Set 2)
+        ext0.header['CDELT1'] = (self.stepSpacing, "arcsec")
+        ext0.header['CDELT2'] = (self.arcsecPerPixel, "arcsec")
+        ext0.header['CDELT3'] = (round(self.wavelengthArray[1] - self.wavelengthArray[0], 3), "Angstrom")
+        ext0.header['CTYPE1'] = 'HPLN-TAN'
+        ext0.header['CTYPE2'] = 'HPLT-TAN'
+        ext0.header['CTYPE3'] = 'WAVE'
+        ext0.header['CUNIT1'] = 'arcsec'
+        ext0.header['CUNIT2'] = 'arcsec'
+        ext0.header['CUNIT3'] = 'Angstrom'
+        ext0.header['CRVAL1'] = round(centerCoord.Tx.value, 3)
+        ext0.header['CRVAL2'] = round(centerCoord.Ty.value, 3)
+        ext0.header['CRVAL3'] = round(self.wavelengthArray[0], 3)
+        ext0.header['CRPIX1'] = correctedScan.shape[0]/2
+        ext0.header['CRPIX2'] = correctedScan.shape[1] / 2
+        ext0.header['CRPIX3'] = 1
+        ext0.header['CROTAN'] = round(metadata['DST_GDRN'][0], 3)
+        for i in range(len(self.hairlines)):
+            ext0.header['HAIRLN'+str(i+1)] = self.hairlines[i]
+        # Processing history
+        for i in range(len(prsteps)):
+            ext0.header['PRSTEP'+str(i+1)] = (prsteps[i], prstep_comments[i])
+
+        fitsHDUs = [ext0]
+
+        fitsHeaderKeys = list(ext0.header.keys())[8:]
+
+        # Write v-map extensions
+        for i in range(len(vmapList)):
+            ext = fits.ImageHDU(vmapList[i])
+            for key in fitsHeaderKeys:
+                ext.header[key] = (ext0.header[key], ext0.header.comments[key])
+            ext.header['EXTNAME'] = 'VMAP-'+str(i+1)
+            ext.header['BTYPE'] = 'Velocity'
+            ext.header['BUNIT'] = 'km/s'
+            ext.header['REFWVL'] = rwvlList[i]
+            ext.header['METHOD'] = 'Fourier Phase'
+            del ext.header['CDELT3']
+            del ext.header['CTYPE3']
+            del ext.header['CUNIT3']
+            del ext.header['CRVAL3']
+            del ext.header['CRPIX3']
+            fitsHDUs.append(ext)
+
+        # Finally, metadata extension
+        # Get start of each exposure expressed as seconds since midnight
+        timedeltas = (metadata['TIMESTAMPS'] - metadata['TIMESTAMPS'][0].astype("datetime64[D]"))
+        timedeltas = timedeltas.astype('timedelta64[ms]').astype(float) / 1000
+        columns = [
+            fits.Column(
+                name='WAVELNGTH',
+                format='D',
+                unit='ANGSTROM',
+                array=self.wavelengthArray
+            ),
+            fits.Column(
+                name='T_ELAPSED',
+                format='D',
+                unit='SECONDS',
+                array=timedeltas,
+                time_ref_pos=metadata['TIMESTAMPS'][0].astype('datetime64[D]').astype(str)
+            ),
+            fits.Column(
+                name='EXPTIMES',
+                format='D',
+                unit='MS',
+                array=metadata['EXPTIME']
+            ),
+            fits.Column(
+                name='STONYLAT',
+                format='D',
+                unit='DEG',
+                array=metadata['DST_SLAT']
+            ),
+            fits.Column(
+                name='STONYLNG',
+                format='D',
+                unit='DEG',
+                array=metadata['DST_SLNG']
+            ),
+            fits.Column(
+                name='CROTAN',
+                format='D',
+                unit='DEG',
+                array=metadata['DST_GDRN']
+            ),
+            fits.Column(
+                name='LIGHTLVL',
+                format='D',
+                unit='UNITLESS',
+                array=metadata['DST_LLVL']
+            ),
+            fits.Column(
+                name='SCINT',
+                format='D',
+                unit='ARCSEC',
+                array=metadata['DST_SEE']
+            )
+        ]
+
+        ext = fits.BinTableHDU.from_columns(columns)
+        ext.header['EXTNAME'] = 'METADATA'
+        fitsHDUs.append(ext)
+
+        fitsHDUList = fits.HDUList(fitsHDUs)
+        try:
+            fitsHDUList.writeto(outfile, overwrite=True)
+        except:
+            print("Could not write FITS file: ""{0}".format(outfile))
+            print("Continuing...")
+
         return

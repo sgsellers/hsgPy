@@ -197,13 +197,15 @@ def select_lines_singlepanel(array, nselections):
     return xvals
 
 
-def select_lines_singlepanel_unbound(array):
+def select_lines_singlepanel_unbound_xarr(array, xarr=None):
     """
     Matplotlib-based function to select an x-value, or series of x-values
     From the plot of a 1D array.
 
     :param array: array-like
         Array to plot and select from
+    :param array: array-like
+        Optional x array to plot against.
     :return xvals: array-like
         Array of selected x-values with length nselections
     """
@@ -211,7 +213,9 @@ def select_lines_singlepanel_unbound(array):
     fig = plt.figure()
     ax = fig.add_subplot(111)
     ax.set_title("Select Positions, then close window")
-    spectrum, = ax.plot(array)
+    if xarr is None:
+        xarr = np.arange(len(array))
+    spectrum, = ax.plot(xarr, array)
 
     xvals = []
 
@@ -219,7 +223,7 @@ def select_lines_singlepanel_unbound(array):
         xcd = event.xdata
         ax.axvline(xcd, c='C1', linestyle=':')
         fig.canvas.draw()
-        xvals.append(xcd)
+        xvals.append(find_nearest(xarr, xcd))
         print("Selected: " + str(xcd))
 
     conn = fig.canvas.mpl_connect('button_press_event', onselect)
@@ -263,14 +267,14 @@ def select_lines_doublepanel(array1, array2, nselections):
                 xcd = event.xdata
                 ax1.axvline(xcd, c='C1', linestyle=':')
                 fig.canvas.draw()
-                xvals1.append(xcd)
+                xvals1.append(int(xcd))
                 print("Selected: " + str(xcd))
         elif event.inaxes == ax2:
             if len(xvals2) < int(nselections/2):
                 xcd = event.xdata
                 ax2.axvline(xcd, c='C1', linestyle=':')
                 fig.canvas.draw()
-                xvals2.append(xcd)
+                xvals2.append(int(xcd))
                 print("Selected: " + str(xcd))
 
         if (len(xvals1) >= int(nselections/2)) & (len(xvals2) >= int(nselections/2)):
@@ -279,8 +283,8 @@ def select_lines_doublepanel(array1, array2, nselections):
 
     conn = fig.canvas.mpl_connect('button_press_event', onselect)
     plt.show()
-    xvals1 = np.array(xvals1)
-    xvals2 = np.array(xvals2)
+    xvals1 = np.array(xvals1, dtype=np.int_)
+    xvals2 = np.array(xvals2, dtype=np.int_)
     return xvals1, xvals2
 
 
@@ -396,6 +400,9 @@ def detect_beams_hairlines(image, threshold=0.5, hairline_width=5, line_width=15
     # We'll do this by checking if the first edge is < 100, and adding 0 as the first edge if it isn't
     # Then, if the length of edges is even, we're good. If it's odd, we add the last index as well.
     edges = sorted(edges)
+    # Fudge: No edges detected (beam fills)
+    if len(edges) == 0:
+        edges = [0, len(yprofile) - 1]
     if edges[0] > 100:
         edges = [0] + edges
     if len(edges) % 2 == 1:
@@ -404,6 +411,7 @@ def detect_beams_hairlines(image, threshold=0.5, hairline_width=5, line_width=15
     hairline_centers = []
     for i in range(len(hairline_starts)):
         hairline_centers.append((hairline_starts[i] + hairline_ends[i])/2)
+    print(hairline_centers)
 
     # We can use similar logic to find the beam edges in x.
     # Flatten in the other direction, and avoid spectral line residuals in the same way we picked out hairlines
@@ -518,7 +526,6 @@ def create_gaintables(flat, lines_indices,
 
     corrected_flat = masked_flat / coarse_gaintable
 
-    master_shifts = np.zeros((iterations, corrected_flat.shape[0]))
     for i in range(iterations):
         skew_shifts = spectral_skew(corrected_flat[:, lines_indices[0]:lines_indices[1]])
         deskew_corrected_flat = np.zeros(corrected_flat.shape)
