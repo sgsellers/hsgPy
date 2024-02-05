@@ -566,6 +566,7 @@ class hsgCal:
             (12, 4),
             self.wavelengthArray[1] - self.wavelengthArray[0]
         )
+        self.fringeTpl /= np.nanmedian(self.fringeTpl)
 
         return
 
