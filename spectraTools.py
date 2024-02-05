@@ -10,7 +10,9 @@ import scipy.signal as scig
 import warnings
 
 from importlib import resources
+from matplotlib.widgets import Slider
 import FTS_atlas
+import tqdm
 
 """
 This file contains generalized helper functions for Spectrograph/Spectropolarimeter
@@ -288,7 +290,7 @@ def select_lines_doublepanel(array1, array2, nselections):
     return xvals1, xvals2
 
 
-def spectral_skew(image, order=2, slit_reference=0.5):
+def spectral_skew(image, order=2, slit_reference=0.25):
     """
     Adaptation of the deskew1.pro function included in firs-soft, spinor-soft.
     In the y-direction of the input array, it determines the position of the line
@@ -335,13 +337,12 @@ def spectral_skew(image, order=2, slit_reference=0.5):
     for i in range(len(polycoeff)):
         core_polynomial += polycoeff[i] * yrange**i
     core_linear = lincoeff[0] + yrange*lincoeff[1]
-
-    shifts = -(core_polynomial - core_linear[int(slit_reference * image.shape[0])])
+    shifts = (core_polynomial - core_linear[int(slit_reference * image.shape[0])])
 
     if np.nanmean(shifts) >= 7.5:
         warnings.warn("Large average shift ("+str(np.nanmean(shifts))+") measured along the slit. Check your inputs.")
 
-    return shifts
+    return -shifts
 
 
 def detect_beams_hairlines(image, threshold=0.5, hairline_width=5, line_width=15):
@@ -411,7 +412,6 @@ def detect_beams_hairlines(image, threshold=0.5, hairline_width=5, line_width=15
     hairline_centers = []
     for i in range(len(hairline_starts)):
         hairline_centers.append((hairline_starts[i] + hairline_ends[i])/2)
-    print(hairline_centers)
 
     # We can use similar logic to find the beam edges in x.
     # Flatten in the other direction, and avoid spectral line residuals in the same way we picked out hairlines
@@ -446,8 +446,326 @@ def detect_beams_hairlines(image, threshold=0.5, hairline_width=5, line_width=15
 
 
 def create_gaintables(flat, lines_indices,
-                      hairline_positions=None, neighborhood=50,
-                      iterations=3, hairline_width=3, edge_padding=3):
+                      hairline_positions=None, neighborhood=6,
+                      hairline_width=3, edge_padding=10):
+    """
+    Creates the gain of a given input flat field beam.
+    This assumes a deskewed field, and will determine the shift of the template mean profile, then detrend the spectral
+    profile, leaving only the background detector flat field.
+    :param flat: numpy.ndarray
+        Dark-corrected flat field image to determine the gain for
+    :param lines_indices: list
+        Indices of the spectral line to use for deskew. Form [idx_low, idx_hi]
+    :param hairline_positions: list
+        List of hairline y-centers. If None, hairlines are not masked. May cause issues in line position finding.
+    :param neighborhood: int
+        Size of region to use in median filtering for comparison profile calculation.
+    :param hairline_width: int
+        Width of hairlines for masking. Default is 3
+    :param edge_padding: int
+        Cuts the profile arrays by this amount on each end to avoid edge effects.
+    :return gaintable: numpy.ndarray
+        Gain table from iterating along overlapping subdivisions
+    :return coarse_gaintable: numpy.ndarray
+        Gain table from using full slit-averaged profile
+    :return init_skew_shifts: numpy.ndarray
+        Shifts used in initial flat field deskew. Can be applied to final gain-corrected science maps.
+    """
+    masked_flat = flat.copy()
+    if hairline_positions is not None:
+        for line in hairline_positions:
+            masked_flat[int(line - hairline_width - 1):int(line + hairline_width), :] = np.nan
+    init_skew_shifts = spectral_skew(masked_flat[:, lines_indices[0]:lines_indices[1]])
+    init_deskew = np.zeros(masked_flat.shape)
+    for i in range(masked_flat.shape[0]):
+        init_deskew[i, :] = scind.shift(masked_flat[i, :], init_skew_shifts[i], mode='nearest')
+    mean_profile = np.nanmean(
+        init_deskew[
+            int(init_deskew.shape[0]/2 - 30):int(init_deskew.shape[0]/2 + 30), :
+        ],
+        axis=0
+    )
+    mean_profile_center = find_line_core(mean_profile[lines_indices[0]-3:lines_indices[1]+3]) + lines_indices[0] - 3
+    shifted_lines = np.zeros(masked_flat.shape)
+    sh = []
+    for i in range(masked_flat.shape[0]):
+        if i == 0:
+            last_nonnan = np.nan
+        line_position = find_line_core(
+            masked_flat[i, lines_indices[0]-3:lines_indices[1]+3]
+        ) + lines_indices[0] - 3
+        if np.isnan(line_position):
+            if np.isnan(last_nonnan):
+                shift = 0
+            else:
+                shift = last_nonnan - mean_profile_center
+        else:
+            shift = line_position - mean_profile_center
+            last_nonnan = line_position
+        sh.append(shift)
+        shifted_lines[i, :] = scind.shift(mean_profile, shift, mode='nearest')
+    coarse_gaintable = flat / shifted_lines
+    if hairline_positions is not None:
+        for line in hairline_positions:
+            coarse_gaintable[int(line - hairline_width - 1):int(line + hairline_width), :] = 1
+
+    # Smooth rough gaintable in the chosen line
+    if lines_indices[0] < 20:
+        lowidx = 0
+    else:
+        lowidx = lines_indices[0] - 20
+    if lines_indices[1] > flat.shape[0] - 20:
+        highidx = flat.shape[0] - 1
+    else:
+        highidx = lines_indices[1] + 20
+    for i in range(coarse_gaintable.shape[1]):
+        coarse_gaintable[lines_indices[0] - 7:lines_indices[1] + 7, i] = np.nanmean(coarse_gaintable[lowidx:highidx, i])
+
+    corrected_flat = masked_flat / coarse_gaintable
+
+    skew_shifts = spectral_skew(corrected_flat[:, lines_indices[0]:lines_indices[1]])
+    deskew_corrected_flat = np.zeros(corrected_flat.shape)
+    for j in range(corrected_flat.shape[0]):
+        deskew_corrected_flat[j, :] = scind.shift(corrected_flat[j, :], skew_shifts[j], mode='nearest')
+    shifted_lines = np.zeros(corrected_flat.shape)
+    if hairline_positions is not None:
+        for line in hairline_positions:
+            deskew_corrected_flat[
+                int(line - hairline_width - 1):int(line + hairline_width), :
+            ] = deskew_corrected_flat[(int(line + hairline_width + 2))]
+            corrected_flat[
+            int(line - hairline_width - 1):int(line + hairline_width), :
+            ] = corrected_flat[(int(line + hairline_width + 2))]
+    mean_profiles = scind.median_filter(deskew_corrected_flat, size=(neighborhood, 1))
+    for j in tqdm.tqdm(range(corrected_flat.shape[0]), desc="Constructing Gain Tables"):
+        ref_profile = corrected_flat[j, :] / np.nanmedian(corrected_flat[j, :])
+        mean_profile = mean_profiles[j, :] / np.nanmedian(mean_profiles[j, :])
+        mean_profile = scind.shift(mean_profile, -skew_shifts[j], mode='nearest')
+        line_shift = iterate_shifts(
+            ref_profile[edge_padding:-edge_padding],
+            mean_profile[edge_padding:-edge_padding]
+        )
+        sh.append(line_shift)
+        shifted_lines[j, :] = scind.shift(mean_profile, line_shift, mode='nearest')
+    gaintable = flat/shifted_lines
+    gaintable /= np.nanmedian(gaintable)
+    if hairline_positions is not None:
+        for line in hairline_positions:
+            gaintable[int(line - hairline_width - 1):int(line + hairline_width), :] = 1
+
+    return gaintable, coarse_gaintable, init_skew_shifts
+
+
+def iterate_shifts(reference_profile, mean_profile, nzones=5):
+    """
+    Determines best shift for the mean profile to the reference profile from the median shift in each of N zones
+    :param reference_profile: numpy.ndarray
+        Profile to determine shifts to
+    :param mean_profile: numpy.ndarray
+        Profile to shift
+    :param nzones: int
+        Number of subfields to consider shifts for
+    :return: float
+        Median of each subfield shift
+    """
+    reference_slices = np.array_split(reference_profile, nzones)
+    mean_slices = np.array_split(mean_profile, nzones)
+    shifts = np.zeros(len(mean_slices))
+    for i in range(len(reference_slices)):
+        shifts[i] = scopt.minimize_scalar(
+            fit_profile,
+            bounds=(-5, 5),
+            args=(reference_slices[i], mean_slices[i])
+        ).x
+    return np.nanmedian(shifts)
+
+
+def fit_profile(shift, reference_profile, mean_profile, landing_width=5):
+    """
+    Alternate minimization of shift residuals using the final "gain" image
+    :param shift: float
+        Value for shift
+    :param reference_profile: numpy.ndarray
+        Reference profile to divide against
+    :param mean_profile: numpy.ndarray
+        Mean Profile for division
+    :param landing_width: int
+        determines slope/bg of residuals. Higher to negate edge effects
+    :return fit_metric: float
+        Sum of "gain" profile
+    """
+    shifted_mean = scind.shift(mean_profile, shift, mode='nearest')
+    divided = reference_profile / shifted_mean
+    slope = (np.nanmean(divided[-landing_width:]) - np.nanmean(divided[:landing_width])) / divided.size
+    bg = slope * np.arange(divided.size) + np.nanmean(divided[:landing_width])
+    gainsub = np.abs(divided - bg)
+    fit_metric = np.nansum(gainsub[np.isfinite(gainsub)])
+    return fit_metric
+
+
+def prefilter_correction(spectral_image, wavelength_array,
+                         reference_profile, reference_wavelength,
+                         polynomial_order=2, edge_padding=10, smoothing=(20, 4)):
+    """
+    Performs prefilter/grating efficiency correction for the spectral image.
+    The algorithm is similar to the gain table creation, but the reference profile here is a fiducial, such as the FTS
+    atlas. The spectral image is median smoothed in both axes, the reference profile is matched and divided out,
+    Then a polynomial fit to the residuals functions as a prefilter correction
+    :param spectral_image: numpy.ndarray
+        Single slit position of the shape (ny, nlambda)
+    :param wavelength_array: numpy.ndarray
+        Array of reference wavelengths, of the shape (nlambda)
+    :param reference_profile: numpy.ndarray
+        From the FTS atlas or other, of the shape (nlambda(ref)). Will be interpolated to wavelength_array grid
+    :param reference_wavelength: numpy.ndarray
+        From the FTS atlas or other, of the shape (nlamda(ref)). Used in interpolation
+    :param polynomial_order: int
+        Order of polynomial for residual fit. Usually 2 is sufficient. The major wavelength-direction variation is
+        due to a combination of grating efficiency drop-off and prefilter efficiency drop-off, both of which are
+        vaguely quadratic.
+    :param edge_padding: int
+        Amount to cut from the wavelength edges before fit. Final result is applied over the full wavelength range
+    :param smoothing: tuple or int
+        Passed through to scipy.ndimage.median_filter as the filter footprint
+    :return prefilter_profiles: numpy.ndarray
+        Shape (ny, nlambda) of normalized polynomials along the slit. Dividing by this should detrend prefilter curve.
+    """
+
+    ref_prof = scinterp.CubicSpline(
+        reference_wavelength,
+        reference_profile
+    )(wavelength_array)
+    if type(smoothing) is tuple:
+        smoothed_ref = scind.median_filter(ref_prof, size=smoothing[1])
+    else:
+        smoothed_ref = scind.median_filter(ref_prof, size=smoothing)
+    smoothed_profiles = scind.median_filter(spectral_image, size=smoothing)
+    prefilter_profiles = np.zeros(spectral_image.shape)
+    for j in tqdm.tqdm(range(smoothed_profiles.shape[0]), desc="Determining prefilter curves"):
+        data_profile = smoothed_profiles[j, :] / np.nanmedian(smoothed_profiles[j, :])
+        line_shift = iterate_shifts(
+            data_profile[edge_padding:-edge_padding],
+            smoothed_ref[edge_padding:-edge_padding]
+        )
+        shifted_ref = scind.shift(smoothed_ref, line_shift, mode='nearest')
+        profile_to_fit = data_profile[edge_padding:-edge_padding] / shifted_ref[edge_padding:-edge_padding]
+        coef = np.polynomial.polynomial.Polynomial.fit(
+            np.arange(len(profile_to_fit)), profile_to_fit, polynomial_order
+        ).convert().coef
+        poly_prof = np.zeros(smoothed_profiles.shape[1])
+        for i in range(len(coef)):
+            poly_prof += coef[i] * np.arange(len(poly_prof))**i
+        prefilter_profiles[j, :] = poly_prof / np.nanmedian(poly_prof)
+    return prefilter_profiles
+
+
+def fourier_fringe_correction(fringe_cube, freqency_cutoff, smoothing, dlambda):
+    """
+    Performs simple masking in Fourier space for fringe correction.
+    Returns a normalized fringe template for division
+    :param fringe_cube: numpy.ndarray
+        Datacube with fringes
+    :param freqency_cutoff:
+        Cutoff frequency. Everything outside this is considered fringe
+    :param smoothing: tuple of int or int
+        Pass-through to scipy.ndimage.median_filter. Smooths datacube in spatial/spectral dimension
+    :param dlambda: float
+        Wavelength resolution for use in determining cutoff freqs.
+    :return fringe_template: numpy.ndarray
+        Normalized fringes from fringe_cube. Dividing fringe_cube by this should yield a non-fringed image.
+    """
+    smooth_cube = scind.median_filter(fringe_cube, smoothing)
+    fringe_template = np.zeros(smooth_cube.shape)
+    fftfreqs = np.fft.fftfreq(smooth_cube.shape[1], dlambda)
+    lowcut = fftfreqs <= -freqency_cutoff
+    highcut = fftfreqs >= freqency_cutoff
+    for i in range(fringe_template.shape[0]):
+        prof = np.fft.fft(smooth_cube[i, :])
+        prof[lowcut] = 0
+        prof[highcut] = 0
+        fringe_template[i, :] = np.real(np.fft.ifft(prof))
+    return fringe_template
+
+
+def select_fringe_freq(wave, profile, init_period):
+    """
+    Allows user to adjust fringe frequencies and select best cutoff for template.
+    :param wave: numpy.ndarray
+        Wavelength array
+    :param profile: numpy.ndarray
+        Spectral profile
+    :param init_period: float
+        Initial periodicities
+    :return period_slider.value: float
+        Value for cut
+    """
+
+    def fourier_cutter(wave, profile, freq):
+        ft = np.fft.fft(profile)
+        fq = np.fft.fftfreq(len(profile), wave[1] - wave[0])
+        ft[fq >= 1/freq] = 0
+        ft[fq <= -1/freq] = 0
+        return np.real(np.fft.ifft(ft))
+
+    fig, ax = plt.subplots()
+    static, = ax.plot(wave, profile, lw=2, label='Original')
+    fourier, = ax.plot(wave, fourier_cutter(wave, profile, init_period), lw=2, label='Fringe Template')
+    corr, = ax.plot(
+        wave,
+        profile/(fourier_cutter(
+            wave, profile, init_period
+        )/np.nanmedian(fourier_cutter(wave, profile, init_period))) + np.nanmedian(profile) / 4,
+        lw=2, label='Corrected')
+    fig.subplots_adjust(bottom=0.25)
+    ax.set_xlabel("Wavelength")
+    ax.set_title("Set desired period, then close window")
+    ax.legend(loc='lower right')
+    axpd = fig.add_axes([0.25, 0.1, 0.65, 0.03])
+    period_slider = Slider(ax=axpd, label='Period', valmin=1e-5, valmax=4, valinit=init_period)
+    def update(val):
+        fourier.set_ydata(fourier_cutter(wave, profile, period_slider.val))
+        corr.set_ydata(profile/(
+                fourier_cutter(
+                    wave, profile, period_slider.val
+                )/np.nanmedian(fourier_cutter(wave, profile, period_slider.val))
+        ) + np.nanmedian(profile) / 4)
+        fig.canvas.draw_idle()
+    period_slider.on_changed(update)
+    plt.show()
+    return 1/period_slider.val
+
+
+def fit_profile_old(shift, reference_profile, mean_profile):
+    """
+    For use with scipy.optimize.curve_fit; this function shifts reference profile by "shift"
+    and returns its chi-squared value relative to mean_profile
+
+    :param shift: float
+        Value for shift
+    :param reference_profile: array-like
+        The reference profile to shift against
+    :param mean_profile: array-like
+        The mean profile to shift to match reference
+    :return chisq: float
+        Chisquared value for reference relative to shifted mean profile
+    """
+    shifted_mean = scind.shift(mean_profile, shift, mode='nearest')
+    divided = reference_profile/shifted_mean
+    lincoef = np.polynomial.polynomial.Polynomial.fit(
+        np.arange(len(divided)), divided, 1
+    ).convert().coef
+    fit_line = np.arange(len(divided)) * lincoef[1] + lincoef[0]
+
+    return chi_square(divided, fit_line)
+
+
+def chi_square(fit, prior):
+    return np.nansum((fit - prior)**2)/len(fit)
+
+
+def create_gaintables_old(flat, lines_indices,
+                      hairline_positions=None, neighborhood=6,
+                      iterations=3, hairline_width=3, edge_padding=10):
     """
     Creates the gain of a given input flat field beam.
     This assumes a deskewed field, and will determine the shift of the template mean profile, then detrend the spectral
@@ -527,56 +845,60 @@ def create_gaintables(flat, lines_indices,
     corrected_flat = masked_flat / coarse_gaintable
 
     for i in range(iterations):
+        # if neighborhood < 6:
+        #     neighborhood = 6
         skew_shifts = spectral_skew(corrected_flat[:, lines_indices[0]:lines_indices[1]])
         deskew_corrected_flat = np.zeros(corrected_flat.shape)
         for j in range(corrected_flat.shape[0]):
             deskew_corrected_flat[j, :] = scind.shift(corrected_flat[j, :], skew_shifts[j], mode='nearest')
         shifted_lines = np.zeros(corrected_flat.shape)
+        if hairline_positions is not None:
+            for line in hairline_positions:
+                deskew_corrected_flat[
+                    int(line - hairline_width - 1):int(line + hairline_width), :
+                ] = deskew_corrected_flat[(int(line + hairline_width + 2))]
+                corrected_flat[
+                int(line - hairline_width - 1):int(line + hairline_width), :
+                ] = corrected_flat[(int(line + hairline_width + 2))]
+        mean_profiles = scind.median_filter(deskew_corrected_flat, size=(neighborhood, 1))
+        # return mean_profiles
+        sh = []
         for j in range(corrected_flat.shape[0]):
-            if np.isnan(corrected_flat[j, 0]):
-                continue
-            if j < int(neighborhood/2):
-                mean_profile = np.nanmean(deskew_corrected_flat[:neighborhood, :], axis=0)
-            elif j > corrected_flat.shape[0] - int(neighborhood/2):
-                mean_profile = np.nanmean(deskew_corrected_flat[-neighborhood:, :], axis=0)
-            else:
-                mean_profile = np.nanmean(deskew_corrected_flat[j-int(neighborhood/2):j+int(neighborhood/2), :], axis=0)
+            # if np.isnan(corrected_flat[j, 0]):
+            #     continue
+            # if j < int(neighborhood/2):
+            #     mean_profile = np.nanmean(deskew_corrected_flat[:neighborhood, :], axis=0)
+            # elif j > corrected_flat.shape[0] - int(neighborhood/2):
+            #     mean_profile = np.nanmean(deskew_corrected_flat[-neighborhood:, :], axis=0)
+            # else:
+            #     mean_profile = np.nanmean(deskew_corrected_flat[j-int(neighborhood/2):j+int(neighborhood/2), :], axis=0)
+
+            # line_shift = scopt.minimize_scalar(
+            #     fit_profile,
+            #     bounds=(-5, 5),
+            #     args=(
+            #         corrected_flat[j, edge_padding:-edge_padding],
+            #         mean_profile[edge_padding:-edge_padding]
+            #     )
+            # ).x
+            # if j == 50:
+            #     return corrected_flat[j, edge_padding:-edge_padding], mean_profile[edge_padding:-edge_padding], line_shift, skew_shifts[j]
+            ref_profile = corrected_flat[j, :] / np.nanmedian(corrected_flat[j, :])
+            mean_profile = mean_profiles[j, :] / np.nanmedian(mean_profiles[j, :])
             mean_profile = scind.shift(mean_profile, -skew_shifts[j], mode='nearest')
-            line_shift = scopt.minimize_scalar(
-                fit_profile,
-                bounds=(-1, 1),
-                args=(
-                    corrected_flat[j, edge_padding:-edge_padding],
-                    mean_profile[edge_padding:-edge_padding]
-                )
-            ).x
+            line_shift = iterate_shifts(
+                ref_profile[edge_padding:-edge_padding],
+                mean_profile[edge_padding:-edge_padding]
+            )
+            sh.append(line_shift)
             shifted_lines[j, :] = scind.shift(mean_profile, line_shift, mode='nearest')
+
         gaintable = flat/shifted_lines
+        gaintable = gaintable / np.nanmedian(gaintable)
         if hairline_positions is not None:
             for line in hairline_positions:
                 gaintable[int(line - hairline_width - 1):int(line + hairline_width), :] = 1
         corrected_flat = masked_flat / gaintable
+        # neighborhood = int(neighborhood / 2)
 
-    return gaintable, coarse_gaintable, init_skew_shifts
-
-
-def fit_profile(shift, reference_profile, mean_profile):
-    """
-    For use with scipy.optimize.curve_fit; this function shifts reference profile by "shift"
-    and returns its chi-squared value relative to mean_profile
-
-    :param shift: float
-        Value for shift
-    :param reference_profile: array-like
-        The reference profile to shift against
-    :param mean_profile: array-like
-        The mean profile to shift to match reference
-    :return chisq: float
-        Chisquared value for reference relative to shifted mean profile
-    """
-    shifted_mean = scind.shift(mean_profile, shift, mode='nearest')
-    return chi_square(shifted_mean, reference_profile)
-
-
-def chi_square(fit, prior):
-    return np.nansum((fit - prior)**2)/len(fit)
+    return gaintable, coarse_gaintable, init_skew_shifts, shifted_lines

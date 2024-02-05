@@ -101,6 +101,8 @@ class hsgCal:
         self.coarseGain = None
         # Required for a few things, might as well store it.
         self.deskewedFlat = None
+        self.prefilterCurves = None
+        self.fringeTpl = None
 
         self.baseDir = ""
         self.reduceDir = ""
@@ -134,6 +136,8 @@ class hsgCal:
         self.stepSpacing = 0
         self.arcsecPerPixel = 0
         self.beamThreshold = 0.5
+        self.pfcDegree = 0
+        self.fringeWave = 0
 
         self.referenceFTSspec = []
         self.referenceFTSwave = []
@@ -151,9 +155,12 @@ class hsgCal:
         self.hsg_configure_run()
         self.hsg_get_cal_images()  # Includes creating cal images if req'd
         self.hsg_save_cal_images()
-        if self.fringeMethod != "NONE":
-            self.hsg_fringe_correction()
         self.hsg_wavelength_calibration()
+        self.hsg_prefilter_profile_calculation()
+        if self.fringeMethod != "NONE":
+            self.hsg_fringe_template()
+        else:
+            self.fringeTpl = np.ones(self.solarGain.shape)
         self.hsg_perform_scan_calibration(selectLine=True)  # Includes velocity determination of selected line
         return
 
@@ -245,7 +252,13 @@ class hsgCal:
         else:
             self.lineSelectionMethod = "MANUAL"
 
+        if 'prefilterDegree'.lower() in list(config[self.camera].keys()):
+            self.pfcDegree = int(config[self.camera]['prefilterDegree'])
         self.fringeMethod = config[self.camera]['fringeCorrection'].upper()
+        if 'fringeWavelength'.lower() in list(config[self.camera].keys()):
+            self.fringeWave = float(config[self.camera]['fringeWavelength'])
+        else:
+            self.fringeWave = 'SELECT'
 
         if config[self.camera]['reverseWave'].upper() == "TRUE":
             self.flipWave = True
@@ -404,7 +417,10 @@ class hsgCal:
 
     def hsg_compute_gain(self):
         """
-        Computes solar gain and finds the beam edges
+        Computes solar gain and finds the beam edges.
+        WHY IS THIS DOING WORSE THAN THE TEST CASE?????
+        Has to do with line selection...
+        Original line selection works. Is there a crop issue?
         :return:
         """
         # Step 0: Determine beam/spectral edges & hairline positions.
@@ -452,46 +468,105 @@ class hsgCal:
                 4
             )
             hsgLineCores = [
-                int(spex.find_line_core(centralProfile[x - 5:x + 5]) + x + 5) for x in hsgLines
+                int(spex.find_line_core(centralProfile[x - 5:x + 5]) + x - 5) for x in hsgLines
             ]
             ftslinecores = [
-                spex.find_line_core(fts_spec[x - 5:x + 5]) + x + 5 for x in ftsLines
+                spex.find_line_core(fts_spec[x - 20:x + 9]) + x - 20 for x in ftsLines
             ]
             # Step 1.5: Save reference profile and line centers for later
+            print(hsgLines, hsgLineCores)
             self.lineSelectionIndices = hsgLineCores
             self.ftsSelectionIndices = ftslinecores
             self.referenceFTSwave = fts_wave
             self.referenceFTSspec = fts_spec
 
         # Step 2: Iterate gain table per selected line
-        gains = []
-        coarse_gains = []
-        deskews = []
-        gainmeans = []
-        for line in self.lineSelectionIndices:
-            g, cg, desk = spex.create_gaintables(
+        # Note that I've found an issue in the lpff method of line finding. At the bottom of the slit,
+        # it tends to produce spurious results. I think it's because at the bottom of the slit, the profile
+        # tends to be towards the start of the slice with a lot after it.
+        # To compensate, we'll go with -10/+4 for the slice instead of even on either side.
+        # Since this is just for HSG, I'm okay (if hesitant) hardcoding it. But since we took the fiducial slice
+        # from the center of the array, and profiles not in the center are leftwards, I think we'll be okay...
+        if not self.flipWave:
+            gain, coarse, deskew = spex.create_gaintables(
                 croppedFlat,
-                [line - 5, line + 5],
+                [self.lineSelectionIndices[0] - 10, self.lineSelectionIndices[0] + 5],
                 hairline_positions=self.hairlines
             )
-            gains.append(g / np.nanmedian(g))
-            coarse_gains.append(cg / np.nanmedian(cg))
-            deskews.append(desk)
-            gainmeans.append(np.nanmean(g / np.nanmedian(g)))
-        # Step 3: Find the gain table with the mean nearest 1 (i.e., best table)
-        gainidx = spex.find_nearest(np.array(gainmeans), 1)
-        self.solarGain = gains[gainidx]
-        self.coarseGain = coarse_gains[gainidx]
-        self.deskewShifts = deskews[gainidx]
+        if self.flipWave:
+            gain, coarse, deskew = spex.create_gaintables(
+                croppedFlat,
+                [self.lineSelectionIndices[0] - 5, self.lineSelectionIndices[0] + 10],
+                hairline_positions=self.hairlines
+            )
+        self.solarGain = gain
+        self.coarseGain = coarse
+        self.deskewShifts = deskew
+        # gains = []
+        # coarse_gains = []
+        # deskews = []
+        # gainmean = []
+        # for line in self.lineSelectionIndices:
+        #     g, cg, desk = spex.create_gaintables(
+        #         croppedFlat,
+        #         [line - 7, line + 7],
+        #         hairline_positions=self.hairlines
+        #     )
+        #     gains.append(g)
+        #     coarse_gains.append(cg)
+        #     deskews.append(desk)
+        #     gainmean.append(np.nanmean(g))
+        # # Step 3: Find the gain table with the mean nearest 1 (i.e., best table)
+        # gainidx = spex.find_nearest(gainmean, 1)
+        # self.solarGain = gains[gainidx]
+        # self.coarseGain = coarse_gains[gainidx]
+        # self.deskewShifts = deskews[gainidx]
         return
 
 
-    def hsg_fringe_correction(self):
+    def hsg_prefilter_profile_calculation(self):
+        """
+        Determines prefilter curves along the slit
+        """
+        if self.pfcDegree == 0:
+            self.prefilterCurves = np.ones(self.deskewedFlat.shape)
+        else:
+            flat_image = (self.avgFlat - self.avgDark) / self.lampGain
+            flat_image = flat_image[self.beamEdges[0]:self.beamEdges[1], self.spectralEdges[0]:self.spectralEdges[1]]
+            flat_image /= self.solarGain
+            self.prefilterCurves = spex.prefilter_correction(
+                flat_image,
+                self.wavelengthArray,
+                self.referenceFTSspec,
+                self.referenceFTSwave,
+                polynomial_order=self.pfcDegree
+            )
+        return
+
+
+    def hsg_fringe_template(self):
         """
         Sets up parameters used for Fourier fringe correction.
         Writing this one only after the rest of the pipeline has been tested.
         :return:
         """
+        if self.fringeWave == 'SELECT':
+            mean_profile = np.nanmean(
+                self.deskewedFlat[
+                    int(self.deskewedFlat.shape[0]/2 - 30):int(self.deskewedFlat.shape[0]/2 + 30), :
+                ], axis=0)
+            self.fringeWave = spex.select_fringe_freq(
+                self.wavelengthArray,
+                mean_profile,
+                1/0.5
+            )
+        self.fringeTpl = spex.fourier_fringe_correction(
+            self.deskewedFlat,
+            self.fringeWave,
+            (12, 4),
+            self.wavelengthArray[1] - self.wavelengthArray[0]
+        )
+
         return
 
     def hsg_wavelength_calibration(self):
@@ -500,7 +575,8 @@ class hsgCal:
         :return:
         """
         croppedFlat = self.avgFlat - self.avgDark
-        croppedFlat = croppedFlat / self.lampGain
+        if self.lampGain is not None:
+            croppedFlat = croppedFlat / self.lampGain
         croppedFlat = croppedFlat[self.beamEdges[0]:self.beamEdges[1], self.spectralEdges[0]:self.spectralEdges[1]]
         croppedFlat = croppedFlat / self.solarGain
         deskewedFlat = np.zeros(croppedFlat.shape)
@@ -543,7 +619,7 @@ class hsgCal:
         :return:
         """
         for i in tqdm.tqdm(range(len(self.scanList)), desc="Correcting Scans"):
-            with fits.open(self.scanList[i]) as schdu:
+            with (fits.open(self.scanList[i]) as schdu):
                 # Corrected data cubes are set up as ny, nx, nlambda
                 # This is consistent with the FIRS L-1.5 data products.
                 correctedDataCube = np.zeros(
@@ -587,21 +663,39 @@ class hsgCal:
                         rasterStep = np.flip(rasterStep, axis=1)
                     rasterStep = rasterStep - self.avgDark
                     if self.lampGain is not None:
-                        rasterStep = rasterStep / self.lampGain
+                        rasterStep /= self.lampGain
                     rasterStep = rasterStep[
                         self.beamEdges[0]:self.beamEdges[1],
                          self.spectralEdges[0]:self.spectralEdges[1]
                     ]
-                    rasterStep = rasterStep / self.solarGain
+                    rasterStep /= self.solarGain
+                    rasterStep /= self.prefilterCurves
                     # Extra step here: applying the deskew from the gain table creation step.
                     # There should be no wavelength variation along the slit now.
-                    deskewedRasterStep = np.zeros(rasterStep.shape)
+                    deskraster = np.zeros(rasterStep.shape)
                     for k in range(rasterStep.shape[0]):
-                        correctedDataCube[k, j - 1, :] = scind.shift(
+                        deskraster[k, :] = scind.shift(
                             rasterStep[k, :],
                             self.deskewShifts[k],
                             mode='nearest'
                         )
+                    # New extra step: determining bulk shift between deskewed flat mean profile
+                    # and the scan deskewed profile. We'll reuse common code for it.
+                    bulkShift = spex.iterate_shifts(
+                        np.nanmean(self.deskewedFlat[
+                            int(self.deskewedFlat.shape[0] / 2 - 30):int(self.deskewedFlat.shape[0] / 2 + 30),
+                            10:-10
+                        ], axis=0),
+                        np.nanmean(deskraster[
+                            int(deskraster.shape[0] / 2 - 30):int(deskraster.shape[0] / 2 + 30), 10:-10
+                        ], axis=0)
+                    )
+                    correctedDataCube[:, j - 1, :] = scind.shift(
+                        deskraster,
+                        (0, bulkShift),
+                        mode='nearest'
+                    ) / self.fringeTpl
+
                 metaparams = np.rec.fromarrays(
                     [
                         np.array(timestamps, dtype='datetime64[ms]'),
@@ -641,8 +735,8 @@ class hsgCal:
         """
         if not self.velocityMapLineIndex:
             meanProfile = np.nanmean(
-                self.deskewedFlat[int(self.deskewedFlat.shape[0]/2 - 30):int(self.deskewedFlat.shape[0]/2 + 30), :],
-                axis=0
+                spectralCube[int(spectralCube.shape[0]/2 - 30):int(spectralCube.shape[0]/2 + 30), :, :],
+                axis=(0, 1)
             )
             vmapCoarseIndices = spex.select_lines_singlepanel_unbound_xarr(meanProfile, xarr=self.wavelengthArray)
             vmapFineIndices = [
@@ -708,6 +802,9 @@ class hsgCal:
         if self.fringeMethod != "NONE":
             prsteps.append("FRINGE-CORRECTION")
             prstep_comments.append("hsgPy/SSOSoft, Fourier Filter")
+        if self.pfcDegree != 0:
+            prsteps.append("PREFILTER-CORRECTION")
+            prstep_comments.append("hsgPy/SSOSoft, FTS Comparison")
         if vmapList:
             prsteps.append("LOS-VELOCITY")
             prstep_comments.append("hsgPy/SSOSoft, Fourier Phases")
