@@ -146,6 +146,7 @@ class hsgCal:
         self.flipWave = False
 
         self.velocityMapLineIndex = None
+        self.refwvls = []
 
 
     def hsg_run_calibration(self):
@@ -715,11 +716,100 @@ class hsgCal:
                     ]
                 )
                 if selectLine:
-                    vmaps, refwvls = self.hsg_create_velocity_maps(correctedDataCube)
-                    self.packageScan(correctedDataCube, metaparams, vmapList=vmaps, rwvlList=refwvls)
+                    imaps, vmaps, wmaps = self.hsg_create_moment_maps(correctedDataCube)
+                    self.packageScan(
+                        correctedDataCube,
+                        metaparams,
+                        imapList=imaps,
+                        vmapList=vmaps,
+                        wmapList=wmaps,
+                        rwvlList=self.refwvls
+                    )
                 else:
                     self.packageScan(correctedDataCube, metaparams)
         return
+
+
+    def hsg_create_moment_maps(self, spectralCube):
+        """
+        Generates integrated intensity, Doppler velocity, and Doppler width maps from user-selected spectral lines.
+        These parameters are found using moment analysis.
+        If self.velocityMapLineIndex is None, will prompt the user to select lines from the mean of the gain-corrected
+        flat field.
+        :param spectralCube: numpy.ndarray
+            Reduced datacube of the shape (ny, nx, nlambda)
+        :return imaps: list
+            List of intensity maps for each selected range
+        :return vmaps: list
+            List of LOS velocity maps for each selected range
+        :return wmaps: list
+            List of Doppler width maps for each selected range
+        """
+        if self.velocityMapLineIndex is None:
+            flat = self.deskewedFlat / self.fringeTpl
+            meanProfile = np.nanmean(
+                flat[int(flat.shape[0]/2 - 30):int(flat.shape[0]/2 + 30), :],
+                axis=0
+            )
+            # meanProfile = np.nanmean(
+            #     spectralCube[int(spectralCube.shape[0]/2 - 30):int(spectralCube.shape[0]/2 + 30), :, :],
+            #     axis=(0, 1)
+            # )
+            # User-selected ranges
+            vmapCoarseIndices = spex.select_spans_singlepanel(meanProfile, xarr=self.wavelengthArray)
+            # Minimum location of each line in range
+            vmapMidIndices = [
+                spex.find_nearest(
+                    meanProfile[vmapCoarseIndices[x][0]:vmapCoarseIndices[x][1]],
+                    meanProfile[vmapCoarseIndices[x][0]:vmapCoarseIndices[x][1]].min()
+                ) + vmapCoarseIndices[x][0] for x in range(vmapCoarseIndices.shape[0])
+            ]
+            # Exact core location
+            vmapCores = [
+                spex.find_line_core(meanProfile[x - 7:x + 7]) + x - 7 for x in vmapMidIndices
+            ]
+            # And their wavelengths...
+            refwvls = [
+                float(scinterp.interp1d(
+                    np.arange(len(self.wavelengthArray)),
+                    self.wavelengthArray,
+                    kind='linear'
+                )(x)) for x in vmapCores
+            ]
+
+            # List comprehension, my beloved
+            # Now, find start and end indices that put refwvls at the center of the window.
+            vmapIndices = np.zeros(vmapCoarseIndices.shape)
+            for i in range(vmapCoarseIndices.shape[0]):
+                averageDelta = np.nanmean(np.abs(vmapCoarseIndices[i, :] - int(vmapCores[i])))
+                vmapIndices[i, 0] = int(vmapCores[i] - averageDelta)
+                vmapIndices[i, 1] = int(vmapCores[i] + averageDelta)
+            self.velocityMapLineIndex = vmapIndices.astype(int)
+            self.refwvls = refwvls
+        imaps = []
+        vmaps = []
+        wmaps = []
+        for i in tqdm.tqdm(range(self.velocityMapLineIndex.shape[0]), desc='Creating L1.5 Maps'):
+            imap = np.zeros((spectralCube.shape[0], spectralCube.shape[1]))
+            vmap = np.zeros(imap.shape)
+            wmap = np.zeros(imap.shape)
+            with tqdm.tqdm(total=vmap.shape[0]*vmap.shape[1]) as pbar:
+                pbar.set_description("Performing Moment Analyses...")
+                for j in range(imap.shape[0]):
+                    for k in range(imap.shape[1]):
+                        intens, vel, wid = spex.moment_analysis(
+                            self.wavelengthArray[self.velocityMapLineIndex[i][0]:self.velocityMapLineIndex[i][1]],
+                            spectralCube[j, k, self.velocityMapLineIndex[i][0]:self.velocityMapLineIndex[i][1]],
+                            self.refwvls[i]
+                        )
+                        imap[j, k] = intens
+                        vmap[j, k] = vel
+                        wmap[j, k] = wid
+                        pbar.update(1)
+            imaps.append(imap)
+            vmaps.append(vmap)
+            wmaps.append(wmap)
+        return imaps, vmaps, wmaps
 
 
     def hsg_create_velocity_maps(self, spectralCube):
@@ -765,15 +855,22 @@ class hsgCal:
         return vmaps, refwvls
 
 
-    def packageScan(self, correctedScan, metadata, vmapList=None, rwvlList=None):
+    def packageScan(
+            self,
+            correctedScan, metadata,
+            imapList=None, vmapList=None, wmapList=None, rwvlList=None):
         """
         Packages corrected scans, along with the level-1.5 velocity products
         :param correctedScan: numpy.ndarray
             Dark, gain corrected scan for save.
         :param metadata: nump.rec.array
             Numpy recarray of import header attributes
+        :param imapList: list of numpy.ndarray
+            List of 2D numpy.ndarrays corresponding to intensity maps
         :param vmapList: list of numpy.ndarray
             List of 2D numpy.ndarrays corresponding to velocity maps
+        :param wmapList: list of numpy.ndarray
+            List of 2D numpy.ndarrays corresponding to Doppler width maps
         :param rwvlList: list of float
             List of wavelength values used as reference wavelengths for corresponding vmap.
         :return:
@@ -807,8 +904,8 @@ class hsgCal:
             prsteps.append("PREFILTER-CORRECTION")
             prstep_comments.append("hsgPy/SSOSoft, FTS Comparison")
         if vmapList:
-            prsteps.append("LOS-VELOCITY")
-            prstep_comments.append("hsgPy/SSOSoft, Fourier Phases")
+            prsteps.append("MOMENT-ANALYSIS")
+            prstep_comments.append("hsgPy/SSOSoft, Moment Analysis")
 
         centerCoord = SkyCoord(
             metadata['DST_SLNG'][0] * u.deg, metadata['DST_SLAT'][0] * u.deg,
@@ -870,16 +967,74 @@ class hsgCal:
 
         fitsHeaderKeys = list(ext0.header.keys())[8:]
 
+        # Write i-map extensions
+        for i in range(len(imapList)):
+            ext = fits.ImageHDU(imapList[i])
+            for key in fitsHeaderKeys:
+                ext.header[key] = (ext0.header[key], ext0.header.comments[key])
+            ext.header['EXTNAME'] = 'IMAP-' + str(i + 1)
+            ext.header['BTYPE'] = 'Integrated Intensity'
+            ext.header['BUNIT'] = 'int(DN)'
+            ext.header['REFWVL'] = rwvlList[i]
+            ext.header['WAVE1'] = (
+                self.wavelengthArray[self.velocityMapLineIndex[i, 0]],
+                "Lower-bound wavelength for moment analysis"
+            )
+            ext.header['WAVE2'] = (
+                self.wavelengthArray[self.velocityMapLineIndex[i, 1]],
+                "Upper-bound wavelength for moment analysis"
+            )
+            ext.header['METHOD'] = 'Moment Analysis'
+            del ext.header['CDELT3']
+            del ext.header['CTYPE3']
+            del ext.header['CUNIT3']
+            del ext.header['CRVAL3']
+            del ext.header['CRPIX3']
+            fitsHDUs.append(ext)
+
         # Write v-map extensions
         for i in range(len(vmapList)):
             ext = fits.ImageHDU(vmapList[i])
             for key in fitsHeaderKeys:
                 ext.header[key] = (ext0.header[key], ext0.header.comments[key])
             ext.header['EXTNAME'] = 'VMAP-'+str(i+1)
-            ext.header['BTYPE'] = 'Velocity'
+            ext.header['BTYPE'] = 'LOS Velocity'
             ext.header['BUNIT'] = 'km/s'
             ext.header['REFWVL'] = rwvlList[i]
-            ext.header['METHOD'] = 'Fourier Phase'
+            ext.header['WAVE1'] = (
+                self.wavelengthArray[self.velocityMapLineIndex[i, 0]],
+                "Lower-bound wavelength for moment analysis"
+            )
+            ext.header['WAVE2'] = (
+                self.wavelengthArray[self.velocityMapLineIndex[i, 1]],
+                "Upper-bound wavelength for moment analysis"
+            )
+            ext.header['METHOD'] = 'Moment Analysis'
+            del ext.header['CDELT3']
+            del ext.header['CTYPE3']
+            del ext.header['CUNIT3']
+            del ext.header['CRVAL3']
+            del ext.header['CRPIX3']
+            fitsHDUs.append(ext)
+
+        # Write w-map extensions
+        for i in range(len(wmapList)):
+            ext = fits.ImageHDU(wmapList[i])
+            for key in fitsHeaderKeys:
+                ext.header[key] = (ext0.header[key], ext0.header.comments[key])
+            ext.header['EXTNAME'] = 'WMAP-' + str(i + 1)
+            ext.header['BTYPE'] = 'Velocity Width'
+            ext.header['BUNIT'] = 'km/s'
+            ext.header['REFWVL'] = rwvlList[i]
+            ext.header['WAVE1'] = (
+                self.wavelengthArray[self.velocityMapLineIndex[i, 0]],
+                "Lower-bound wavelength for moment analysis"
+            )
+            ext.header['WAVE2'] = (
+                self.wavelengthArray[self.velocityMapLineIndex[i, 1]],
+                "Upper-bound wavelength for moment analysis"
+            )
+            ext.header['METHOD'] = 'Moment Analysis'
             del ext.header['CDELT3']
             del ext.header['CTYPE3']
             del ext.header['CUNIT3']

@@ -3,6 +3,7 @@ import matplotlib
 import numpy as np
 import numpy.polynomial.polynomial as npoly
 import matplotlib.pyplot as plt
+import scipy.integrate as scint
 import scipy.interpolate as scinterp
 import scipy.ndimage as scind
 import scipy.optimize as scopt
@@ -11,6 +12,8 @@ import warnings
 
 from importlib import resources
 from matplotlib.widgets import Slider
+from astropy.constants import c
+c_kms = c.value/1e3
 import FTS_atlas
 import tqdm
 
@@ -231,6 +234,45 @@ def select_lines_singlepanel_unbound_xarr(array, xarr=None):
     conn = fig.canvas.mpl_connect('button_press_event', onselect)
     plt.show()
     xvals = np.array(xvals)
+    return xvals
+
+
+def select_spans_singlepanel(array, xarr=None):
+    """
+    Matplotlib-based function to select x range from the plot of a 1D array.
+
+    :param array: array-like
+        Array to plot and select from
+    :param xarr: array-like
+        Optional x array to plot against.
+    :return xvals: numpy.ndarray
+        Array of selected x-spans with shape (2, nselections)
+    """
+    fig = plt.figure()
+    ax = fig.add_subplot(111)
+    ax.set_title("Click to select min and max of spectral regions. Close window when done.")
+    if xarr is None:
+        xarr = np.arange(len(array))
+    spectrum, = ax.plot(xarr, array)
+
+    xvals = []
+    n = 1
+
+    def onselect(event):
+        nonlocal n
+        xcd = event.xdata
+        xvals.append(find_nearest(xarr, xcd))
+        ax.axvline(xcd, c='C' + str(n), linestyle=':')
+
+        if (len(xvals) % 2 == 0) & (len(xvals) != 0):
+            ax.axvspan(xarr[xvals[-2]], xarr[xvals[-1]], fc='C' + str(n), alpha=0.3)
+            n += 1
+        fig.canvas.draw()
+        print("Selected: " + str(xcd))
+
+    conn = fig.canvas.mpl_connect('button_press_event', onselect)
+    plt.show()
+    xvals = np.sort(np.array(xvals).reshape(int(len(xvals)/2), 2))
     return xvals
 
 
@@ -721,7 +763,7 @@ def select_fringe_freq(wave, profile, init_period):
     ax.set_title("Set desired period, then close window")
     ax.legend(loc='lower right')
     axpd = fig.add_axes([0.25, 0.1, 0.65, 0.03])
-    period_slider = Slider(ax=axpd, label='Period', valmin=1e-5, valmax=4, valinit=init_period)
+    period_slider = Slider(ax=axpd, label='Period', valmin=1e-5, valmax=6, valinit=init_period)
     def update(val):
         fourier.set_ydata(fourier_cutter(wave, profile, period_slider.val))
         corr.set_ydata(profile/(
@@ -733,6 +775,30 @@ def select_fringe_freq(wave, profile, init_period):
     period_slider.on_changed(update)
     plt.show()
     return 1/period_slider.val
+
+
+def moment_analysis(wave, intens, refwvl):
+    """
+    Performs simple moment analysis of an input spectral profile.
+    :param wave: numpy.ndarray
+        Wavelength grid
+    :param intens: numpy.ndarray
+        Intensity values
+    :param refwvl: float
+        Reference wavelength value
+    :return I: float
+        Intensity value
+    :return v: float
+        Doppler velocity (km/s)
+    :return w: float
+        Doppler width (km/s)
+    """
+    I = scint.simpson(intens, x=wave)
+    m1 = scint.simpson(intens * (wave - refwvl), x=wave)
+    m2 = scint.simpson(intens * (wave - refwvl)**2, x=wave)
+    v = (c_kms/refwvl) * (m1/I)
+    w = np.sqrt((c_kms/refwvl) * (m2/I))
+    return I, v, w
 
 
 def fit_profile_old(shift, reference_profile, mean_profile):
