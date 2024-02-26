@@ -777,7 +777,7 @@ def select_fringe_freq(wave, profile, init_period):
     return 1/period_slider.val
 
 
-def moment_analysis(wave, intens, refwvl):
+def moment_analysis(wave, intens, refwvl, continuumCorrect=True):
     """
     Performs simple moment analysis of an input spectral profile.
     :param wave: numpy.ndarray
@@ -793,6 +793,11 @@ def moment_analysis(wave, intens, refwvl):
     :return w: float
         Doppler width (km/s)
     """
+    if continuumCorrect:
+        slope = (np.nanmean(intens[-3:]) - np.nanmean(intens[:3])) / (wave[-1] - wave[0])
+        line = wave*slope
+        line /= np.nanmedian(line)
+        intens /= line
     I = scint.simpson(intens, x=wave)
     m1 = scint.simpson(intens * (wave - refwvl), x=wave)
     m2 = scint.simpson(intens * (wave - refwvl)**2, x=wave)
