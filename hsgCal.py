@@ -697,11 +697,10 @@ class hsgCal:
                         ], axis=0)
                     )
                     correctedDataCube[:, j - 1, :] = scind.shift(
-                        deskraster,
+                        np.nan_to_num(deskraster),
                         (0, bulkShift),
                         mode='nearest'
                     ) / self.fringeTpl
-
                 metaparams = np.rec.fromarrays(
                     [
                         np.array(timestamps, dtype='datetime64[ms]'),
