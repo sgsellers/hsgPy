@@ -635,14 +635,18 @@ class hsgCal:
                 # This is not noted in the obs logs, but IS noted in the HSG header
                 # Which stores the entire AIW script.
                 # We'll do a quick parse of the script and grab the line with "step" in it.
-                aiwScript = list(schdu[0].header['COMMENT'])
-                # Lines with "#" are comment lines
-                aiwSteps = [x for x in aiwScript if "step" in x and "#" not in x]
-                # Relies on the somewhat naive assumption that there's only one step command in the script
-                # And that the step size is the last thing in that line.
-                # This should be okay -- sometimes the effort needed to generalize a thing is greater
-                # than the effort needed to write a hack that will work 99.9999999% of the time.
-                self.stepSpacing = float(aiwSteps[0].split(" ")[-1])
+                if "COMMENT" in list(schdu[0].header.keys()):
+                    aiwScript = list(schdu[0].header['COMMENT'])
+                    # Lines with "#" are comment lines
+                    aiwSteps = [x for x in aiwScript if "step" in x and "#" not in x]
+                    # Relies on the somewhat naive assumption that there's only one step command in the script
+                    # And that the step size is the last thing in that line.
+                    # This should be okay -- sometimes the effort needed to generalize a thing is greater
+                    # than the effort needed to write a hack that will work 99.9999999% of the time.
+                    self.stepSpacing = float(aiwSteps[0].split(" ")[-1])
+                # If HSG was run by GUI
+                else:
+                    self.stepSpacing = float(schdu[1].header['HSG_STEP'])
                 timestamps = []
                 dst_slat = []
                 dst_slng = []
